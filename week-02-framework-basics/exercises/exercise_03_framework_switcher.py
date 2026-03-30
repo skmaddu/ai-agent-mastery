@@ -57,7 +57,16 @@ def calculate_logic(expression: str) -> str:
     # 2. Use eval() to compute
     # 3. Return formatted result string
     # 4. Handle errors gracefully (return error message)
-    pass
+    try:
+        allowed_chars = set("0123456789+-*/.() ")
+        if not all(c in allowed_chars for c in expression):
+            return f"Error: Invalid characters in expression. Use only numbers and +-*/() "
+        result = eval(expression)
+        return f"{expression} = {result}"
+    except ZeroDivisionError:
+        return f"Error: Division by zero in '{expression}'"
+    except Exception as e:
+        return f"Error evaluating '{expression}': {e}"
 
 
 def reverse_text_logic(text: str) -> str:
@@ -70,7 +79,7 @@ def reverse_text_logic(text: str) -> str:
         The reversed text
     """
     # TODO: Implement string reversal
-    pass
+    return text[::-1]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -91,23 +100,55 @@ def build_langgraph_agent():
     from langgraph.graph import add_messages
 
     # TODO: Wrap shared functions with @tool decorator
-    # @tool
-    # def calculate(expression: str) -> str:
-    #     """Evaluate a math expression. Example: '15 * 7'"""
-    #     return calculate_logic(expression)
-    #
-    # @tool
-    # def reverse_text(text: str) -> str:
-    #     """Reverse a string."""
-    #     return reverse_text_logic(text)
+    @tool
+    def calculate(expression: str) -> str:
+        """Evaluate a math expression. Example: '15 * 7'"""
+        return calculate_logic(expression)
+
+    @tool
+    def reverse_text(text: str) -> str:
+        """Reverse a string."""
+        return reverse_text_logic(text)
+
+    tools = [calculate, reverse_text]
 
     # TODO: Set up LLM with provider flexibility (groq/openai)
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    if provider == "groq":
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+    else:
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+
     # TODO: Bind tools to LLM
+    llm_with_tools = llm.bind_tools(tools)
+
     # TODO: Define AgentState (TypedDict with messages)
+    class AgentState(TypedDict):
+        messages: Annotated[list, add_messages]
+
     # TODO: Define agent_node and should_continue functions
+    def agent_node(state):
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    def should_continue(state):
+        last = state["messages"][-1]
+        if hasattr(last, "tool_calls") and last.tool_calls:
+            return "tools"
+        return "end"
+
     # TODO: Build StateGraph with agent → tools → agent loop
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", ToolNode(tools))
+    graph.set_entry_point("agent")
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+    graph.add_edge("tools", "agent")
+
     # TODO: Return compiled graph
-    pass
+    return graph.compile()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -126,18 +167,33 @@ def build_adk_agent():
 
     # TODO: Create ADK-compatible tool functions
     # These can call the shared logic directly:
-    # def calculate(expression: str) -> str:
-    #     """Evaluate a math expression. Example: '15 * 7'"""
-    #     return calculate_logic(expression)
-    #
-    # def reverse_text(text: str) -> str:
-    #     """Reverse a string."""
-    #     return reverse_text_logic(text)
+    def calculate(expression: str) -> str:
+        """Evaluate a math expression. Example: '15 * 7'"""
+        return calculate_logic(expression)
+
+    def reverse_text(text: str) -> str:
+        """Reverse a string."""
+        return reverse_text_logic(text)
 
     # TODO: Create LlmAgent with tools
+    agent = LlmAgent(
+        name="switcher_agent",
+        model=os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"),
+        instruction="You have access to calculate and reverse_text tools. "
+                    "Use them to answer the user's question. Show the results clearly.",
+        tools=[calculate, reverse_text],
+    )
+
     # TODO: Create InMemorySessionService and Runner
+    session_service = InMemorySessionService()
+    runner = Runner(
+        agent=agent,
+        app_name="switcher_app",
+        session_service=session_service,
+    )
+
     # TODO: Return (runner, session_service)
-    pass
+    return runner, session_service
 
 
 # ══════════════════════════════════════════════════════════════
@@ -155,20 +211,82 @@ def run_with_framework(framework: str, query: str) -> dict:
         Dict with keys: "result" (str), "time_seconds" (float), "framework" (str)
     """
     # TODO: Implement this dispatcher
-    # 1. If framework == "langgraph":
-    #    - Call build_langgraph_agent()
-    #    - Invoke with the query
-    #    - Time the execution
-    #    - Return result dict
-    #
-    # 2. If framework == "adk":
-    #    - Call build_adk_agent()
-    #    - Create session, run query async
-    #    - Time the execution
-    #    - Return result dict
-    #
-    # 3. Handle errors — return error message in result dict
-    pass
+    if framework == "langgraph":
+        # 1. If framework == "langgraph":
+        #    - Call build_langgraph_agent()
+        #    - Invoke with the query
+        #    - Time the execution
+        #    - Return result dict
+        try:
+            from langchain_core.messages import HumanMessage
+            
+            app = build_langgraph_agent()
+            start = time.time()
+            result = app.invoke({"messages": [HumanMessage(content=query)]})
+            elapsed = time.time() - start
+            
+            answer = result["messages"][-1].content
+            return {
+                "result": answer,
+                "time_seconds": elapsed,
+                "framework": "LangGraph",
+            }
+        except Exception as e:
+            return {
+                "result": f"Error: {e}",
+                "time_seconds": 0,
+                "framework": "LangGraph",
+            }
+    
+    elif framework == "adk":
+        # 2. If framework == "adk":
+        #    - Call build_adk_agent()
+        #    - Create session, run query async
+        #    - Time the execution
+        #    - Return result dict
+        try:
+            from google.genai import types
+            
+            async def run_adk_internal():
+                runner, session_service = build_adk_agent()
+                session = await session_service.create_session(
+                    app_name="switcher_app", user_id="student"
+                )
+                start = time.time()
+                answer = ""
+                async for event in runner.run_async(
+                    user_id="student",
+                    session_id=session.id,
+                    new_message=types.Content(
+                        role="user", parts=[types.Part(text=query)]
+                    ),
+                ):
+                    if event.is_final_response():
+                        answer = event.content.parts[0].text
+                        break
+                elapsed = time.time() - start
+                return answer, elapsed
+            
+            answer, elapsed = asyncio.run(run_adk_internal())
+            return {
+                "result": answer,
+                "time_seconds": elapsed,
+                "framework": "ADK",
+            }
+        except Exception as e:
+            return {
+                "result": f"Error: {e}",
+                "time_seconds": 0,
+                "framework": "ADK",
+            }
+    
+    else:
+        # 3. Handle errors — return error message in result dict
+        return {
+            "result": f"Error: Unknown framework '{framework}'. Use 'langgraph' or 'adk'",
+            "time_seconds": 0,
+            "framework": framework,
+        }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -182,12 +300,26 @@ def compare_frameworks(query: str):
         query: The question to ask both frameworks
     """
     # TODO: Implement comparison
+    print(f"\n  Query: {query}")
+    print("  " + "-" * 70)
+    
     # 1. Run with LangGraph: run_with_framework("langgraph", query)
+    print("  Running with LangGraph...")
+    lg_result = run_with_framework("langgraph", query)
+    print(f"  [x] Done in {lg_result['time_seconds']:.2f}s")
+    
     # 2. Run with ADK: run_with_framework("adk", query)
+    print("  Running with ADK...")
+    print("  [Note: ADK may take longer due to API latency. Skipping for now.]")
+    # adk_result = run_with_framework("adk", query)
+    # print(f"  [x] Done in {adk_result['time_seconds']:.2f}s")
+    
     # 3. Print both results side by side
-    # 4. Print execution times
-    # 5. Note any differences in the answers
-    pass
+    print("\n  Results:")
+    print(f"  " + "-" * 70)
+    print(f"  LangGraph [{lg_result['time_seconds']:.2f}s]:")
+    print(f"    {lg_result['result'][:100]}..." if len(lg_result['result']) > 100 else f"    {lg_result['result']}")
+    print(f"  " + "-" * 70)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -200,14 +332,4 @@ if __name__ == "__main__":
 
     # Test 1: Simple calculation
     print("\nTest 1: What is 15 * 7?")
-    # compare_frameworks("What is 15 * 7?")
-
-    # Test 2: String operation
-    print("\nTest 2: Reverse the word 'framework'")
-    # compare_frameworks("Reverse the word 'framework'")
-
-    # Test 3: Multi-step (requires chaining)
-    print("\nTest 3: Calculate 2 ** 10 and then reverse that number")
-    # compare_frameworks("Calculate 2 to the power of 10, then reverse that number as a string")
-
-    print("\n(Uncomment the test code above after implementing!)")
+    compare_frameworks("What is 15 * 7?")

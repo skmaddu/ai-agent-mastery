@@ -46,17 +46,15 @@ from langgraph.graph import add_messages
 @tool
 def add(a: float, b: float) -> str:
     """Add two numbers together. Example: add(15, 27) returns '15 + 27 = 42'"""
-    # TODO: Implement addition
-    # Return a string like "15.0 + 27.0 = 42.0"
-    pass
+    result = a + b
+    return f"{a} + {b} = {result}"
 
 
 @tool
 def multiply(a: float, b: float) -> str:
     """Multiply two numbers. Example: multiply(8, 12) returns '8 * 12 = 96'"""
-    # TODO: Implement multiplication
-    # Return a string like "8.0 * 12.0 = 96.0"
-    pass
+    result = a * b
+    return f"{a} * {b} = {result}"
 
 
 @tool
@@ -64,66 +62,96 @@ def divide(a: float, b: float) -> str:
     """Divide a by b. Example: divide(100, 4) returns '100 / 4 = 25.0'
     Handles division by zero gracefully.
     """
-    # TODO: Implement division
-    # 1. Check if b is zero — if so, return an error message string
-    #    (DON'T raise an exception — return a friendly error message)
-    # 2. Otherwise, return the result as a string
-    pass
+    if b == 0:
+        return "Error: Division by zero. Cannot divide by zero."
+    result = a / b
+    return f"{a} / {b} = {result}"
+
 
 
 # ── Step 2: Set up the LLM ─────────────────────────────────
-# TODO: Initialize the LLM based on the LLM_PROVIDER env variable
+# Initialize the LLM based on the LLM_PROVIDER env variable.
 # Default to groq, fallback to openai
-# Then bind the tools to the LLM using bind_tools()
 
 tools = [add, multiply, divide]
 
-# TODO: Create llm (ChatGroq or ChatOpenAI based on provider)
-# llm = ...
+provider = os.getenv("LLM_PROVIDER", "groq").lower()
+if provider == "groq":
+    from langchain_groq import ChatGroq
+    llm = ChatGroq(model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"))
+else:
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# TODO: Bind tools to the LLM
-# llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = llm.bind_tools(tools)
 
 
 # ── Step 3: Define the state ────────────────────────────────
-# TODO: Create AgentState TypedDict with:
-#   - messages: Annotated[list, add_messages]
+# TypedDict for the graph state. Messages are appended by add_messages.
 
-# class AgentState(TypedDict):
-#     ...
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    tool_call_count: int
 
 
 # ── Step 4: Define the agent node ──────────────────────────
-# TODO: Create agent_node function that:
-#   1. Calls llm_with_tools.invoke(state["messages"])
-#   2. Returns {"messages": [response]}
-#   3. (Bonus) Add retry logic for malformed tool calls
+# The agent node asks the LLM for the next action (or final answer).
 
-# def agent_node(state):
-#     ...
+def agent_node(state: AgentState) -> dict:
+    for attempt in range(3):
+        try:
+            response = llm_with_tools.invoke(state["messages"])
+            return {"messages": [response]}
+        except Exception as e:
+            if attempt < 2 and ("tool_use_failed" in str(e) or "malformed" in str(e).lower()):
+                print(f"  [Retry {attempt + 1}/3] Malformed tool call, retrying...")
+                continue
+            raise
 
 
 # ── Step 5: Define the routing function ─────────────────────
-# TODO: Create should_continue function that:
-#   1. Checks if the last message has tool_calls
-#   2. Returns "tools" if yes, "end" if no
+MAX_TOOL_CALLS = 5
 
-# def should_continue(state):
-#     ...
+def should_continue(state: AgentState) -> str:
+    last_message = state["messages"][-1]
+
+    if state.get("tool_call_count", 0) >= MAX_TOOL_CALLS:
+        print(f"  [Safety] Max tool calls ({MAX_TOOL_CALLS}) reached. Ending.")
+        return "end"
+
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return "end"
 
 
 # ── Step 6: Build the graph ─────────────────────────────────
-# TODO: Create the StateGraph:
-#   1. Add "agent" node (agent_node function)
-#   2. Add "tools" node (ToolNode(tools))
-#   3. Set entry point to "agent"
-#   4. Add conditional edges from "agent" → "tools" or END
-#   5. Add edge from "tools" → "agent"
-#   6. Compile the graph
+tool_executor = ToolNode(tools)
 
-# graph = StateGraph(AgentState)
-# ...
-# app = graph.compile()
+def tools_node(state: AgentState) -> dict:
+    result = tool_executor.invoke(state)
+    new_count = state.get("tool_call_count", 0) + len(state["messages"][-1].tool_calls)
+    return {
+        "messages": result["messages"],
+        "tool_call_count": new_count,
+    }
+
+
+graph = StateGraph(AgentState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", tools_node)
+graph.set_entry_point("agent")
+
+graph.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "tools": "tools",
+        "end": END,
+    },
+)
+
+graph.add_edge("tools", "agent")
+app = graph.compile()
 
 
 # ── Test your implementation ────────────────────────────────
@@ -134,23 +162,26 @@ if __name__ == "__main__":
 
     # Test 1: Simple addition
     print("\nTest 1: What is 15 + 27?")
-    # result = app.invoke({
-    #     "messages": [HumanMessage(content="What is 15 + 27?")],
-    # })
-    # print(f"Agent: {result['messages'][-1].content}")
+    result = app.invoke({
+        "messages": [HumanMessage(content="What is 15 + 27?")],
+        "tool_call_count": 0,
+    })
+    print(f"Agent: {result['messages'][-1].content}")
 
     # Test 2: Multi-step calculation (requires chaining)
     print("\nTest 2: Multiply 8 by 12, then add 5 to the result")
-    # result = app.invoke({
-    #     "messages": [HumanMessage(content="Multiply 8 by 12, then add 5 to the result")],
-    # })
-    # print(f"Agent: {result['messages'][-1].content}")
+    result = app.invoke({
+        "messages": [HumanMessage(content="Multiply 8 by 12, then add 5 to the result")],
+        "tool_call_count": 0,
+    })
+    print(f"Agent: {result['messages'][-1].content}")
 
     # Test 3: Division by zero (should handle gracefully!)
     print("\nTest 3: Divide 100 by 0")
-    # result = app.invoke({
-    #     "messages": [HumanMessage(content="Divide 100 by 0")],
-    # })
-    # print(f"Agent: {result['messages'][-1].content}")
+    result = app.invoke({
+        "messages": [HumanMessage(content="Divide 100 by 0")],
+        "tool_call_count": 0,
+    })
+    print(f"Agent: {result['messages'][-1].content}")
 
     print("\n(Uncomment the test code above after implementing!)")
